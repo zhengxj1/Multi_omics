@@ -1,3 +1,15 @@
+files <- list.files(path = path, pattern = pattern, full.names = TRUE)
+maf_list <- lapply(files, function(file) {
+  maf= read.maf(maf = file)
+  return(maf)
+ })
+maf_data=merge_mafs(maf_list)
+# 绘制MAF数据概览图（包括突变数量、TMB等统计）
+plotmafSummary(maf = maf_data,
+               rmOutlier = TRUE,        # 移除异常值
+               addStat = "median",      # 添加中位数统计
+               dashboard = TRUE,        # 生成综合仪表盘
+               titvRaw = FALSE)         # 不显示原始Ti/Tv比率
 
 
 
