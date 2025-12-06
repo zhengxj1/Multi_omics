@@ -1,0 +1,428 @@
+# ==============================================================================
+# 0. 环境设置与包加载
+# ==============================================================================
+# 确保安装了 DESeq2
+# if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+# BiocManager::install(c("DESeq2", "ComplexHeatmap", "NMF"))
+# install.packages(c("tidyverse", "factoextra", "dendextend", "RColorBrewer", "circlize", "mclust"))
+
+library(tidyverse)    # 数据清洗
+library(factoextra)   # 聚类可视化
+library(dendextend)   # 树状图
+library(RColorBrewer) # 颜色
+library(NMF)          # NMF聚类
+library(ComplexHeatmap) # 复杂热图
+library(circlize)     # 颜色映射
+library(DESeq2)       # VST 转换的核心包
+library(cluster)      # 剪影系数
+library(mclust)       # ARI
+library(readxl)
+library(limma)
+# ==============================================================================
+# 1. 数据导入与清洗 (RNA-seq Counts)
+# ==============================================================================
+print("--- 1. 正在导入并清洗 RNA 原始计数数据 (gene_counts.xls) ---")
+# 假设 gene_counts.xls 第一列是基因名，后续是样本计数
+data_raw <- read.csv("GNEC bulk counts.csv",row.names = 1)
+data_raw=distinct(data_raw,gene_name,.keep_all = T)
+count_data_df <- data_raw %>%
+  # *** 新增步骤：移除现有的行名 ***
+  remove_rownames() %>%
+  # 步骤 A: 设置行名 (假设 'gene_name' 是第 69 列)
+  column_to_rownames(var = colnames(data_raw)[69]) %>%
+  # 步骤 B: 只保留样本计数列 (从第 1 列到第 68 列)
+  dplyr::select(1:68)
+# 步骤说明：
+filter_genes <- function(expr_matrix, 
+                         protein_coding_only = TRUE,
+                         remove_mitochondrial = TRUE,
+                         remove_ribosomal = TRUE, 
+                         remove_xy = TRUE,
+                         min_cpm = 1, 
+                         min_samples = 0.1) {
+  
+  # 获取基因注释
+  detailed_info <- org.Hs.eg.db::select(org.Hs.eg.db,
+                          keys = rownames(expr_matrix),
+                          columns = c("SYMBOL", "GENENAME", "GENETYPE", 
+                                      "CHR", "CHRLOC", "CHRLOCEND", 
+                                      "ENSEMBL", "ENTREZID", "UNIPROT"),
+                          keytype = "SYMBOL")
+  
+  
+  # 计算CPM并过滤低表达基因
+  cpm_matrix <- apply(expr_matrix, 2, function(x) (x/sum(x)) * 1e6)
+  keep_expr <- rowSums(cpm_matrix >= min_cpm) >= (ncol(expr_matrix) * min_samples)
+  filtered <- expr_matrix[keep_expr, ]
+  # 构建过滤条件
+  gene_info=detailed_info
+  keep_conditions <- rep(TRUE, nrow(gene_info))
+  if(protein_coding_only) {
+    keep_conditions <- keep_conditions & (gene_info$GENETYPE == "protein-coding")
+  }
+  if(remove_ribosomal) {
+    keep_conditions <- keep_conditions & !str_detect(gene_info$SYMBOL, "^RPS|^RPL|^MRPS|^MRPL|^MT")
+  }
+  
+  if(remove_xy) {
+    keep_conditions <- keep_conditions & !(gene_info$CHR %in% c("X", "Y"))
+  }
+  
+  # 应用过滤
+  keep_genes <- gene_info$SYMBOL[keep_conditions]
+  final_matrix <- filtered[rownames(filtered) %in% keep_genes, ]
+  
+  # 输出统计信息
+  cat("原始基因:", nrow(expr_matrix), 
+      "→ 过滤后:", nrow(final_matrix), 
+      "(", round(nrow(final_matrix)/nrow(expr_matrix)*100, 1), "%)\n")
+  
+  return(final_matrix)
+}
+count_data_df=filter_genes(count_data_df )
+# 1. 将第一列（假设是基因名）设为行名。
+# 2. 检查数据类型，确保是整数计数矩阵。
+# 3. 移除表达量全为 0 的基因 (DESeq2 要求)
+count_matrix_raw=count_data_df
+count_matrix <- count_matrix_raw[rowSums(count_matrix_raw) > 0, ]
+# 确保矩阵是整数类型
+count_matrix <- round(count_matrix)
+print(paste("原始计数矩阵维度:", nrow(count_matrix), "基因 x", ncol(count_matrix), "样本"))
+# ==============================================================================
+# 2. VST 转换 (取代 Astral-DIA 和 Log2)
+# ==============================================================================
+print("--- 2. 执行 VST (方差稳定转换) ---")
+# 1. 准备 colData (样本元数据，DESeq2 必需，即使没有分组信息也要创建)
+col_data <- data.frame(row.names = colnames(count_matrix), 
+                       condition = factor(rep("A", ncol(count_matrix)))) # 假定所有样本为同一条件
+# 2. 创建 DESeqDataSet 对象
+dds <- DESeqDataSetFromMatrix(countData = count_matrix,
+                              colData = col_data,
+                              design = ~ 1) # ~1 表示无实验设计，用于无监督转换
+# 3. 执行 VST 转换
+# blind = TRUE 用于无监督分析（聚类），这是标准做法
+vst_result <- vst(dds, blind = TRUE)
+vst_data <- assay(vst_result)
+# 将 VST 矩阵用于后续分析
+log_data <- vst_data # 重命名为 log_data 以匹配后续脚本变量名
+# ==============================================================================
+# 3. MAD 高变基因筛选
+# ==============================================================================
+print("--- 3. 执行 MAD 高变基因筛选 ---")
+TOP_PERCENTAGE <- 0.3 # <---【可修改】保留方差排名前 70% 
+
+# 1. 计算每个基因（行）的 MAD (中位数绝对偏差)
+gene_mad <- apply(log_data, 1, mad)
+print(summary(gene_mad))
+
+# 2. 确定要保留的基因数量
+num_genes_to_keep <- round(nrow(log_data) * TOP_PERCENTAGE)
+
+# 3. 找出高变基因的名称
+gene_mad_sorted <- sort(gene_mad, decreasing = TRUE)
+high_variance_genes <- names(gene_mad_sorted)[1:num_genes_to_keep]
+
+# 目标基因检查 (保持不变)
+target_genes_of_interest <- c('ASCL1', 'YAP1', 'ASCL2', 'NEUROD1', 'CHGA', 'S100P', 'KLF5')
+retained_target_genes <- intersect(high_variance_genes, target_genes_of_interest)
+print(paste("保留的目标基因:", retained_target_genes))
+# 4. 筛选 VST 矩阵
+log_data_filtered <- log_data[high_variance_genes, ]
+log_data <- log_data_filtered # 供后续步骤使用
+
+print(paste("筛选后基因数量 (Top", TOP_PERCENTAGE*100, "%):", nrow(log_data)))
+# Z-score 标准化 (用于 HC 和 K-means，以及热图可视化)
+# 转置为 (样本 x 基因) 进行 scale，然后再转回 (基因 x 样本)
+scaled_matrix_t <- scale(t(log_data)) 
+scaled_data <- as.data.frame(scaled_matrix_t) # 样本为行，基因为列
+# ==============================================================================
+# 4. 方法一：层次聚类 (Hierarchical Clustering)
+# ... (保持不变)
+# ==============================================================================
+print("--- 方法一：层次聚类 ---")
+# 设定您想要的 HC 亚型数量
+# <---【可修改】在此指定 HC 的亚型数
+dist_matrix <- dist(scaled_data, method = "euclidean")
+hclust_result <- hclust(dist_matrix, method = "ward.D2")
+plot(hclust_result, main = "层次聚类树状图", xlab = "样本", ylab = "距离", sub = "")
+# 我们使用 fviz_nbclust 的 Silhouette 和 Elbow 方法来辅助选择 K
+# 运行这个可能需要一些时间
+fviz_nbclust(scaled_data, FUN = hcut, method = "silhouette", k.max = 10)
+fviz_nbclust(scaled_data, FUN = hcut, method = "wss", k.max = 10)
+# 根据 Silhouette 或 WSS 结果，假设我们决定分成 K=3 个亚型
+K_HC <-5 
+subtypes_hc <- cutree(hclust_result, k = K_HC)
+dend <- as.dendrogram(hclust_result)
+dend <- color_branches(dend, k = K_HC)
+plot(dend, main = paste("层次聚类亚型 (K=", K_HC, ")"), 
+     sub = "颜色代表不同的亚型")
+# 结果存入数据框
+subtype_df_hc <- data.frame(Sample = names(subtypes_hc), Subtype_HC = subtypes_hc)
+
+# ==============================================================================
+# 5. 方法二：K-means 聚类
+# ==============================================================================
+print("--- 方法二：K-means 聚类 ---")
+# 设定您想要的 K-means 亚型数量 (通常与 HC 保持一致或通过肘部法则确定)
+K_KM <- 5  # <---【可修改】在此指定 K-means 的亚型数
+set.seed(42)
+kmeans_result <- kmeans(scaled_data, centers = K_KM, nstart = 25)
+fviz_cluster(kmeans_result, 
+             data = scaled_data, 
+             main = paste("K-means 聚类结果 (K=", K_KM, ")"),
+             ellipse.type = "convex", # 椭圆类型
+             geom = "point",          # 显示点
+             palette = "jco"          # 颜色方案
+)
+subtypes_kmeans <- kmeans_result$cluster
+
+# 结果存入数据框
+subtype_df_kmeans <- data.frame(Sample = names(subtypes_kmeans), Subtype_Kmeans = subtypes_kmeans)
+
+# ==============================================================================
+# 6. 方法三：NMF 聚类 (非负矩阵分解)
+# ==============================================================================
+print("--- 方法三：NMF 聚类 ---")
+# 准备非负矩阵 (Log数据平移)
+min_log <- min(log_data)
+V_nmf <- log_data - min_log # 确保 >= 0
+results <- nmf(V_nmf, 
+               rank = 2:8, 
+               nrun = 100, 
+               seed = 12345, 
+               .opt = "v") # .opt="v" 用于显示进度
+
+# 3. 绘制评估指标图，确定最佳 K
+# Cophenetic 曲线：通常选择曲线斜率开始平稳下降的点
+plot(results)
+# 设定 NMF 秩 (K值)
+# 注意：正式运行时请先运行 rank=2:8 nrun=50 查看评估图来决定 K
+# 这里为了流程通畅，直接指定一个最佳 K
+K_NMF <- 5 # <---【可修改】在此指定 NMF 的亚型数
+
+# 运行 NMF
+# 注意：.opt="v" 显示进度，p3 或 p4 可能会比较久，取决于数据量
+nmf_model <- nmf(V_nmf, rank = K_NMF, nrun = 500, seed = 12345, .opt = "v") 
+# 提取亚型
+# 修正：使用 coef() (系数矩阵 H) 来确定样本归属
+H_matrix <- coef(nmf_model) 
+subtypes_nmf <- max.col(t(H_matrix))
+
+# 结果存入数据框
+nmf_subtype_df <- data.frame(Sample = colnames(V_nmf), Subtype_NMF = subtypes_nmf)
+# ==============================================================================
+# 7. 结果合并
+# ==============================================================================
+print("--- 合并聚类结果 ---")
+all_subtypes_df <- subtype_df_hc %>% 
+  left_join(subtype_df_kmeans, by = "Sample") %>%
+  left_join(nmf_subtype_df, by = "Sample") %>%
+  arrange(Sample) # 排序
+pdf()
+print(head(all_subtypes_df))
+# ==============================================================================
+# 8. 绘制比较热图
+# ==============================================================================
+print("--- 绘制最终热图 ---")
+# A. 准备特定基因列表
+# 请务必修改为您数据中真实存在的基因名！
+# 这里随机抽取前 30 个作为示例
+target_genes <- head(rownames(log_data), 30) 
+# 如果您有特定基因，请取消注释并填入：
+# target_genes <- c("TP53", "BRCA1", "EGFR", "MYC") # <---【可修改】
+target_genes=genes_to_check
+# 检查基因是否都在数据中
+valid_genes <- target_genes[target_genes %in% rownames(log_data)]
+if(length(valid_genes) == 0) stop("错误：您选择的基因都不在数据中！")
+
+# B. 提取作图数据 (使用 Z-score 后的数据)
+# 注意：ComplexHeatmap 需要 基因 x 样本
+plot_matrix <- t(scaled_data) # 已经是 Z-score 过的
+plot_matrix_target <- plot_matrix[valid_genes, all_subtypes_df$Sample]
+
+# C. 准备颜色
+# 动态扩展颜色板，防止 K 值过大时报错
+get_colors <- function(k) {
+  cols <- colorRampPalette(brewer.pal(min(k, 8), "Set1"))(k)
+  names(cols) <- 1:k
+  return(cols)
+}
+
+col_hc <- get_colors(K_HC)
+col_km <- get_colors(K_KM)
+col_nmf <- get_colors(K_NMF)
+
+# D. 顶部注释
+ha <- HeatmapAnnotation(
+  HC = as.factor(all_subtypes_df$Subtype_HC),
+  Kmeans = as.factor(all_subtypes_df$Subtype_Kmeans),
+  NMF = as.factor(all_subtypes_df$Subtype_NMF),
+  col = list(HC = col_hc, Kmeans = col_km, NMF = col_nmf),
+  annotation_name_side = "left",
+  gap = unit(c(1, 1), "mm")
+)
+
+# E. 绘图
+# 颜色映射 (Z-score: -2 到 2)
+col_fun <- colorRamp2(c(-2, 0, 2), c("blue", "white", "red"))
+
+ht <- Heatmap(plot_matrix_target,
+              name = "Z-score",
+              col = col_fun,
+              top_annotation = ha,
+              
+              # 按 NMF 结果切分列
+              column_split = all_subtypes_df$Subtype_NMF,
+              column_title = "Samples (Split by NMF)",
+              
+              # 聚类设置
+              cluster_columns = TRUE,
+              cluster_rows = TRUE,
+              show_column_names = FALSE,
+              row_names_gp = gpar(fontsize = 8)
+)
+pdf( paste0(save_path, "/markergens.pdf"))
+draw(ht, merge_legend = TRUE)
+dev.off()
+
+library(cluster)
+# 1. 评估 HC 结果
+sil_hc <- silhouette(subtypes_hc, dist(scaled_data, method = "euclidean"))
+avg_sil_hc <- mean(sil_hc[, 3])
+
+# 2. 评估 K-means 结果
+sil_km <- silhouette(kmeans_result$cluster, dist(scaled_data, method = "euclidean"))
+avg_sil_km <- mean(sil_km[, 3])
+
+# 3. 结果比较  $[-1, 1]
+cat("--- 平均剪影系数 (K=", K_HC, ") ---\n")
+cat("HC 剪影系数:", round(avg_sil_hc, 3), "\n")
+cat("K-means 剪影系数:", round(avg_sil_km, 3), "\n")
+# 可视化 HC 剪影图
+fviz_silhouette(sil_hc, print.summary = FALSE)
+
+library(mclust) # ARI 函数在 mclust 包中
+# 比较 HC 与 NMF 的一致性
+ari_hc_nmf <- adjustedRandIndex(all_subtypes_df$Subtype_HC, all_subtypes_df$Subtype_NMF)
+ari_km_hc <- adjustedRandIndex(all_subtypes_df$Subtype_Kmeans, all_subtypes_df$Subtype_HC)
+ari_km_nmf <- adjustedRandIndex(all_subtypes_df$Subtype_Kmeans, all_subtypes_df$Subtype_NMF)
+cat("--- 聚类方法间的一致性 (ARI) ---\n")
+cat("HC vs NMF ARI:", round(ari_hc_nmf, 3), "\n")
+cat("K-means vs NMF ARI:", round(ari_km_nmf, 3), "\n")
+cat("K-means vs HC ARI:", round(ari_km_hc, 3), "\n")
+# ARI 解释： 0.8+ 代表高度一致，0.5-0.8 代表中等到良好一致。
+
+
+W_matrix <- basis(nmf_model)  # 或者使用: coef(nmf_model)
+# 查看维度
+print(dim(W_matrix))
+print(paste("基因数:", nrow(W_matrix), "因子数:", ncol(W_matrix)))
+
+# 为每个因子提取top N基因
+top_n_genes <- 50  # 每个因子提取前50个基因
+factor_names <- paste0("Factor_", 1:K_NMF)
+
+# 创建一个列表存储每个因子的top基因
+top_genes_list <- list()
+
+for(i in 1:K_NMF){
+  # 按权重降序排序
+  gene_weights <- W_matrix[, i]
+  gene_names <- rownames(W_matrix)
+  
+  # 排序
+  sorted_indices <- order(gene_weights, decreasing = TRUE)
+  sorted_genes <- gene_names[sorted_indices]
+  sorted_weights <- gene_weights[sorted_indices]
+  
+  # 取前top_n_genes个
+  top_genes_list[[factor_names[i]]] <- data.frame(
+    Gene = sorted_genes[1:top_n_genes],
+    Weight = sorted_weights[1:top_n_genes],
+    Rank = 1:top_n_genes
+  )
+  
+  # 打印每个因子的top 10基因
+  print(paste("Factor", i, "Top 10 genes:"))
+  print(head(top_genes_list[[factor_names[i]]], 10))
+}
+dir.create(save_path)
+# 保存结果
+for(i in 1:K_NMF){
+  write.csv(top_genes_list[[factor_names[i]]], 
+            paste0(save_path, "/factor_", i, "_top_genes.csv"), 
+            row.names = FALSE)
+}
+
+
+
+
+write.csv(all_subtypes_df , 
+          paste0(save_path, "/Bulksubtype.csv"), 
+          row.names = FALSE)
+
+target_genes=unique(unlist(top_genes_list))
+valid_genes <- target_genes[target_genes %in% rownames(log_data)]
+if(length(valid_genes) == 0) stop("错误：您选择的基因都不在数据中！")
+
+# B. 提取作图数据 (使用 Z-score 后的数据)
+# 注意：ComplexHeatmap 需要 基因 x 样本
+plot_matrix <- t(scaled_data) # 已经是 Z-score 过的
+plot_matrix_target <- plot_matrix[valid_genes, all_subtypes_df$Sample]
+
+# C. 准备颜色
+# 动态扩展颜色板，防止 K 值过大时报错
+get_colors <- function(k) {
+  cols <- colorRampPalette(brewer.pal(min(k, 8), "Set1"))(k)
+  names(cols) <- 1:k
+  return(cols)
+}
+
+col_hc <- get_colors(K_HC)
+col_km <- get_colors(K_KM)
+col_nmf <- get_colors(K_NMF)
+
+# D. 顶部注释
+ha <- HeatmapAnnotation(
+  HC = as.factor(all_subtypes_df$Subtype_HC),
+  Kmeans = as.factor(all_subtypes_df$Subtype_Kmeans),
+  NMF = as.factor(all_subtypes_df$Subtype_NMF),
+  col = list(HC = col_hc, Kmeans = col_km, NMF = col_nmf),
+  annotation_name_side = "left",
+  gap = unit(c(1, 1), "mm")
+)
+
+# E. 绘图
+# 颜色映射 (Z-score: -2 到 2)
+col_fun <- colorRamp2(c(-2, 0, 2), c("blue", "white", "red"))
+
+ht <- Heatmap(plot_matrix_target,
+              name = "Z-score",
+              col = col_fun,
+              top_annotation = ha,
+              
+              # 按 NMF 结果切分列
+              column_split = all_subtypes_df$Subtype_NMF,
+              column_title = "Samples (Split by NMF)",
+              
+              # 聚类设置
+              cluster_columns = TRUE,
+              cluster_rows = TRUE,
+              show_column_names = FALSE,
+              row_names_gp = gpar(fontsize = 8)
+)
+pdf( paste0(save_path, "/Topgenes.pdf"))
+draw(ht, merge_legend = TRUE)
+dev.off()
+
+
+
+
+
+
+
+
+
+
+
+
