@@ -1,0 +1,492 @@
+###DEG
+library("DESeq2")
+library("limma")
+library("edgeR")
+library(data.table)
+library(tidyverse)
+library(statmod)
+library(Vennerable) 
+library(FactoMineR)
+library(factoextra) 
+library(pheatmap)
+library(tinyarray)
+library(AnnotationHub)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(enrichplot)
+library(cols4all)
+library(egg)
+
+
+expr_cna=read.csv("data.csv",header = T,sep = ",")
+expr_cna=distinct(expr_cna,gene_name,.keep_all = T)
+row.names(expr_cna)=expr_cna$gene_name
+genematx=expr_cna
+expr_cn=genematx[,c(1:3,10:12)]
+
+#分组矩阵
+group_list=c(rep("P",3),rep("G",3),rep("D",3),rep("F",3))
+condition = factor(group_list)
+coldata <- data.frame(row.names = colnames(expr_cn), condition)
+
+#######################差异分析前数据处理
+dir.create("data.processing")
+#标准化及boxplot
+dat=as.data.frame(log2(edgeR::cpm(expr_cn)+1))
+png(filename="boxplot.png",width=480,height=480)  
+boxplot(dat)
+dev.off()
+####PCA####
+source("D:/BaiduSyncdisk/R code/scRNA_scripts/pca_and_ggplot2.R")
+library(ggplot2)
+library(ggpubr)
+library(cowplot)
+dat=t(dat)
+pca.ncg<-.pca(data = dat,
+              is.log =T)
+.scatter.density.pc(pcs = pca.ncg$sing.val$v[, 1:2],
+                    pc.var = pca.ncg$variation,
+                    strokeColor = 'gray30',
+                    strokeSize = .2,
+                    pointSize = 5,
+                    alpha = .6,
+                    title = "PCA",
+                    group.name = "cell lines",
+                    group=group_list,color=color_qualitative2) -> p
+plot(p[[1]])
+ggsave("PCA.pdf",width=6,height = 5,dpi=300)
+
+
+####DESeq2  多样本####
+padjcutoff = 0.05
+Log2FCcutoff = 1
+# 获取所有唯一的分组 # 生成所有可能的两两组合
+groups <- unique(group_list)
+combinations <- combn(groups, 2)
+
+# 创建主结果目录
+main_dir <- "DESeq2_pairwise_results"
+dir.create(main_dir, showWarnings = FALSE)
+# 创建DESeq2对象
+dds <- DESeqDataSetFromMatrix(countData = round(expr_cn),
+                              colData = coldata,
+                              design = ~condition)
+dds <- DESeq(dds)  
+##提取结果进行火山图及富集分析
+for(i in 1:ncol(combinations)) {
+  group1 <- combinations[1, i]
+  group2 <- combinations[2, i]
+  
+  # 为每对比较创建目录
+  comp_dir <- file.path(main_dir, paste0(group1, "_vs_", group2))
+  dir.create(comp_dir, showWarnings = FALSE)
+  
+  # 设置对比
+  contrast <- c('condition', group1, group2)
+  
+  # 执行差异分析
+  res <- results(dds, contrast = contrast)
+  res <- as.data.frame(res)
+  res <- subset(res, padj != "NA")
+  res <- subset(res, log2FoldChange != "NA")
+  res <- res[order(res$padj),]
+  
+  # 添加显著性标记
+  res$sig <- "none"
+  res$sig[which(res$log2FoldChange > Log2FCcutoff & res$padj < padjcutoff)] <- 'up'
+  res$sig[which(res$log2FoldChange < (-Log2FCcutoff) & res$padj < padjcutoff)] <- 'down'
+  
+  # 保存结果
+  DEG_result <- res
+  save(DEG_result, file = file.path(comp_dir, "DEG_DEseq2.rda"))
+  
+  # 写入CSV文件
+  write.csv(DEG_result, file = file.path(comp_dir, "DEG_results.csv"))
+  
+  # 统计差异基因数量
+  up_genes <- sum(DEG_result$sig == "up")
+  down_genes <- sum(DEG_result$sig == "down")
+  
+  # 创建统计文件
+  stats <- data.frame(
+    Comparison = paste0(group1, "_vs_", group2),
+    Upregulated = up_genes,
+    Downregulated = down_genes,
+    Total_DEG = up_genes + down_genes
+  )  
+  write.csv(stats, file = file.path(comp_dir, "DEG_statistics.csv"))
+  
+  # 绘制火山图
+  tryCatch({
+    p <- draw_volcano(DEG_result, pkg = 1, logFC_cutoff = Log2FCcutoff)
+    ggsave(file.path(comp_dir, "volcano_plot.pdf"), p, width = 6, height = 5, dpi = 300)
+  }, error = function(e) {
+    message("火山图绘制失败: ", e$message)
+  })
+  
+  # 执行富集分析
+  comparison_name <- paste0(group1, "_vs_", group2)
+  enrich_results <- run_comprehensive_enrichment (DEG_result, comparison_name, comp_dir)
+  
+  cat("已完成对比:", group1, "vs", group2, 
+      "- 上调:", up_genes, "下调:", down_genes, "\n")
+}
+
+
+
+
+################富集分析####################
+run_comprehensive_enrichment <- function(DEG_data, comparison_name, output_dir) {
+  # 创建富集分析子目录
+  enrich_dir <- file.path(output_dir, "enrichment_analysis")
+  dir.create(enrich_dir, showWarnings = FALSE)
+  
+  # 提取上下调基因
+  UP <- rownames(DEG_data)[DEG_data$sig == "up"]
+  Down <- rownames(DEG_data)[DEG_data$sig == "down"]
+  All <- c(UP, Down)
+  cat("对比:", comparison_name, "- 上调基因:", length(UP), "下调基因:", length(Down), "总差异基因:", length(All), "\n")
+  
+  # GO富集分析函数
+  GO_enrich <- function(gene, type) {
+    if(length(gene) < 5) {
+      message("基因数量不足(", length(gene), ")进行", type, "GO分析")
+      return(NULL)
+    }
+    
+    tryCatch({
+      GSEAgenelist <- bitr(gene, 
+                           fromType = "SYMBOL", 
+                           toType = c("ENTREZID"), 
+                           OrgDb = "org.Hs.eg.db")
+      
+      if(nrow(GSEAgenelist) == 0) {
+        message("没有成功转换的基因ID")
+        return(NULL)
+      }
+      
+      egoBP <- enrichGO(GSEAgenelist$ENTREZID, 
+                        OrgDb = "org.Hs.eg.db", 
+                        ont = "BP", 
+                        pAdjustMethod = "BH", 
+                        pvalueCutoff = 0.05,
+                        qvalueCutoff = 0.1, 
+                        readable = TRUE)
+      
+      if(is.null(egoBP) || nrow(egoBP) == 0) {
+        message(type, "方向没有富集到GO term")
+        return(NULL)
+      }
+
+      return(egoBP)
+    }, error = function(e) {
+      message("GO分析失败: ", type, ": ", e$message)
+      return(NULL)
+    })
+  }
+  
+  # KEGG富集分析函数
+  KEGG_enrich <- function(gene, type) {
+    if(length(gene) < 5) {
+      message("基因数量不足(", length(gene), ")进行", type, "KEGG分析")
+      return(NULL)
+    }
+    
+    tryCatch({
+      GSEAgenelist <- bitr(gene, 
+                           fromType = "SYMBOL", 
+                           toType = c("ENTREZID"), 
+                           OrgDb = "org.Hs.eg.db")
+      
+      if(nrow(GSEAgenelist) == 0) {
+        message("没有成功转换的基因ID")
+        return(NULL)
+      }
+      
+      ekegg <- enrichKEGG(gene = GSEAgenelist$ENTREZID,
+                          organism = 'hsa',
+                          pvalueCutoff = 0.05,
+                          qvalueCutoff = 0.1)
+      
+      if(is.null(ekegg) || nrow(ekegg) == 0) {
+        message(type, "方向没有富集到KEGG通路")
+        return(NULL)
+      }
+      
+      return(ekegg)
+    }, error = function(e) {
+      message("KEGG分析失败: ", type, ": ", e$message)
+      return(NULL)
+    })
+  }
+  
+  # GSEA富集分析函数
+  GSEA_enrich <- function(DEG_data, comparison_name) {
+    tryCatch({
+      # 准备基因列表（按log2FoldChange排序）
+      geneList <- DEG_data$log2FoldChange
+      names(geneList) <- rownames(DEG_data)
+      
+      # 去除NA值
+      geneList <- na.omit(geneList)
+      
+      # 按log2FoldChange降序排列
+      geneList <- sort(geneList, decreasing = TRUE)
+      
+      # ID转换
+      gsea_gene_df <- bitr(names(geneList), 
+                           fromType = "SYMBOL", 
+                           toType = c("ENTREZID"), 
+                           OrgDb = "org.Hs.eg.db")
+      
+      # 根据ENTREZID匹配geneList
+      geneList <- geneList[gsea_gene_df$SYMBOL]
+      names(geneList) <- gsea_gene_df$ENTREZID
+      
+      # 去除重复的ENTREZID
+      geneList <- geneList[!duplicated(names(geneList))]
+      
+      if(length(geneList) < 10) {
+        message("基因数量不足进行GSEA分析")
+        return(NULL)
+      }
+      
+      # GO GSEA
+      gsea_go <- gseGO(geneList = geneList,
+                       OrgDb = org.Hs.eg.db,
+                       ont = "BP",
+                       minGSSize = 10,
+                       maxGSSize = 500,
+                       pvalueCutoff = 0.05,
+                       verbose = FALSE)
+      
+      # KEGG GSEA
+      gsea_kegg <- gseKEGG(geneList = geneList,
+                           organism = 'hsa',
+                           minGSSize = 10,
+                           maxGSSize = 500,
+                           pvalueCutoff = 0.05,
+                           verbose = FALSE)
+      
+      return(list(gsea_go = gsea_go, gsea_kegg = gsea_kegg, geneList = geneList))
+    }, error = function(e) {
+      message("GSEA分析失败: ", e$message)
+      return(NULL)
+    })
+  }
+  
+  # 执行ORA分析
+  go_up <- GO_enrich(UP, "up")
+  go_down <- GO_enrich(Down, "down")
+  go_all <- GO_enrich(All, "all")
+  kegg_up <- KEGG_enrich(UP, "up")
+  kegg_down <- KEGG_enrich(Down, "down")
+  kegg_all <- KEGG_enrich(All, "all")
+  
+  # 执行GSEA分析
+  gsea_results <- GSEA_enrich(DEG_data, comparison_name)
+  
+  # 保存ORA结果
+  if(!is.null(go_up) && nrow(go_up) > 0) {
+    write.csv(go_up, file.path(enrich_dir, paste0(comparison_name, "_GO_UP.csv")))
+  }
+  if(!is.null(go_down) && nrow(go_down) > 0) {
+    write.csv(go_down, file.path(enrich_dir, paste0(comparison_name, "_GO_Down.csv")))
+  }
+  if(!is.null(go_all) && nrow(go_all) > 0) {
+    write.csv(go_all, file.path(enrich_dir, paste0(comparison_name, "_GO_All.csv")))
+  }
+  if(!is.null(kegg_up) && nrow(kegg_up) > 0) {
+    write.csv(kegg_up, file.path(enrich_dir, paste0(comparison_name, "_KEGG_UP.csv")))
+  }
+  if(!is.null(kegg_down) && nrow(kegg_down) > 0) {
+    write.csv(kegg_down, file.path(enrich_dir, paste0(comparison_name, "_KEGG_Down.csv")))
+  }
+  if(!is.null(kegg_all) && nrow(kegg_all) > 0) {
+    write.csv(kegg_all, file.path(enrich_dir, paste0(comparison_name, "_KEGG_All.csv")))
+  }
+  
+  # 保存GSEA结果
+  if(!is.null(gsea_results)) {
+    if(!is.null(gsea_results$gsea_go) && nrow(gsea_results$gsea_go) > 0) {
+      write.csv(gsea_results$gsea_go, file.path(enrich_dir, paste0(comparison_name, "_GSEA_GO.csv")))
+    }
+    if(!is.null(gsea_results$gsea_kegg) && nrow(gsea_results$gsea_kegg) > 0) {
+      write.csv(gsea_results$gsea_kegg, file.path(enrich_dir, paste0(comparison_name, "_GSEA_KEGG.csv")))
+    }
+  }
+  
+  # 绘制ORA图
+  plot_ORA_results <- function(go_up, go_down, go_all, kegg_up, kegg_down, kegg_all, comparison_name, enrich_dir) {
+    # 绘制GO富集图（上下调对比）
+    if(!is.null(go_up) && !is.null(go_down) && 
+       nrow(go_up) > 0 && nrow(go_down) > 0) {
+      
+      go_up_df <- as.data.frame(go_up) 
+      go_down_df <- as.data.frame(go_down)
+      
+      go_up_sorted <- go_up_df[order(go_up_df$pvalue),]
+      go_down_sorted <- go_down_df[order(go_down_df$pvalue),]
+      
+      go_up_top <- head(go_up_sorted, 10)
+      go_down_top <- head(go_down_sorted, 10)
+      
+      if(nrow(go_up_top) > 0 || nrow(go_down_top) > 0) {
+        go_up_top$group <- 1
+        go_down_top$group <- -1
+        dat <- rbind(go_up_top, go_down_top)
+        dat$pvalue <- -log10(dat$pvalue)
+        dat$pvalue <- dat$pvalue * dat$group
+        dat <- dat[order(dat$pvalue, decreasing = F),]
+        dat$threshold <- ifelse(dat$pvalue > 0, 'Up', 'Down')
+        dat$Description <- factor(dat$Description, levels = dat$Description) 
+        
+        mytheme <- theme(axis.text.x = element_text(hjust = 0.5, size = 20), 
+                         axis.ticks.y = element_blank(),
+                         axis.text.y = element_text(size = 20), 
+                         axis.title.x = element_text(size = 20), 
+                         axis.title.y = element_text(size = 20), 
+                         axis.line = element_line(size = 1),
+                         plot.margin = unit(c(1,1,1,1), "cm"),
+                         plot.title = element_text(hjust = 0.5, size = 22),
+                         legend.title = element_text(size = 22), 
+                         legend.text = element_text(size = 20), 
+                         legend.position = "right",
+                         legend.background = element_rect(fill = 'transparent'),
+                         axis.line.y = element_blank(),
+                         panel.grid.major = element_blank(),
+                         panel.grid.minor = element_blank(),
+                         panel.border = element_blank())
+        
+        p2 <- ggplot(dat, aes(x = Description, y = pvalue)) +
+          coord_flip() +
+          geom_segment(aes(x = Description, xend = Description,
+                           y = 0, yend = pvalue, 
+                           linetype = threshold,
+                           color = threshold),
+                       size = 2) + 
+          geom_point(aes(size = Count, color = threshold)) +
+          scale_size_continuous(range = c(1, 3)) +
+          scale_fill_manual(values = c("#007172", "#f29325")) +
+          scale_color_manual(values = c("#007172", "#f29325")) +
+          labs(x = NULL, y = bquote("-"~Log[10]~"(P value)"), 
+               title = paste("GO Enrichment -", comparison_name),
+               color = "Group",
+               linetype = "Group") +
+          scale_y_continuous(expand = expansion(add = c(0.1, 0.1)),
+                             limits = c(-30,40), breaks = seq(-30,40,5))
+        
+        up_pathway <- length(which(dat$pvalue > 0))
+        down_pathway <- length(which(dat$pvalue < 0))
+        high <- nrow(dat)
+        
+        p2 <- p2 + theme_bw() +  mytheme +
+          geom_text(data = dat[1:up_pathway,], 
+                    aes(x = Description, y = 0.1, label = Description),
+                    hjust = 0, color = 'black', size = 6) +
+          geom_text(data = dat[(down_pathway + 1):high,], 
+                    aes(x = Description, y = -0.1, label = Description),
+                    hjust = 1, color = 'black', size = 6) +
+          scale_x_discrete(labels = NULL)
+        
+        ggsave(file.path(enrich_dir, paste0(comparison_name, "_GO_enrichment.pdf")), 
+               p2, width = 20, height = 10)
+      }
+    }
+    
+    # 绘制GO All点图
+    if(!is.null(go_all) && nrow(go_all) > 0) {
+      p_go_all <- dotplot(go_all, showCategory = 15, 
+                          title = paste("GO All DEGs -", comparison_name))
+      ggsave(file.path(enrich_dir, paste0(comparison_name, "_GO_All.pdf")), 
+             p_go_all, width = 12, height = 8)
+    }
+    
+    # 绘制KEGG富集图
+    if(!is.null(kegg_up) && nrow(kegg_up) > 0) {
+      p_kegg_up <- dotplot(kegg_up, showCategory = 15, 
+                           title = paste("KEGG UP -", comparison_name))
+      ggsave(file.path(enrich_dir, paste0(comparison_name, "_KEGG_UP.pdf")), 
+             p_kegg_up, width = 10, height = 8)
+    }
+    
+    if(!is.null(kegg_down) && nrow(kegg_down) > 0) {
+      p_kegg_down <- dotplot(kegg_down, showCategory = 15, 
+                             title = paste("KEGG Down -", comparison_name))
+      ggsave(file.path(enrich_dir, paste0(comparison_name, "_KEGG_Down.pdf")), 
+             p_kegg_down, width = 10, height = 8)
+    }
+    
+    # 绘制KEGG All点图
+    if(!is.null(kegg_all) && nrow(kegg_all) > 0) {
+      p_kegg_all <- dotplot(kegg_all, showCategory = 15, 
+                            title = paste("KEGG All DEGs -", comparison_name))
+      ggsave(file.path(enrich_dir, paste0(comparison_name, "_KEGG_All.pdf")), 
+             p_kegg_all, width = 12, height = 8)
+    }
+  }
+  
+  # 绘制GSEA图
+  plot_GSEA_results <- function(gsea_results, comparison_name, enrich_dir) {
+    if(is.null(gsea_results)) return(NULL)
+    
+    # 绘制GSEA GO图
+    if(!is.null(gsea_results$gsea_go) && nrow(gsea_results$gsea_go) > 0) {
+      # 点图
+      p_gsea_go_dot <- dotplot(gsea_results$gsea_go, showCategory = 15, 
+                               title = paste("GSEA GO -", comparison_name))
+      ggsave(file.path(enrich_dir, paste0(comparison_name, "_GSEA_GO_dot.pdf")), 
+             p_gsea_go_dot, width = 10, height = 8)
+      
+      # 选择最显著的通路绘制详细图
+      top_pathways <- head(gsea_results$gsea_go, 3)
+      for(i in 1:nrow(top_pathways)) {
+        pathway_id <- top_pathways[i, "ID"]
+        pathway_desc <- top_pathways[i, "Description"]
+        
+        p_gsea <- gseaplot2(gsea_results$gsea_go, 
+                            geneSetID = pathway_id,
+                            title = paste("GSEA:", pathway_desc))
+        
+        ggsave(file.path(enrich_dir, paste0(comparison_name, "_GSEA_GO_", pathway_id, ".pdf")), 
+               p_gsea, width = 10, height = 8)
+      }
+    }
+    
+    # 绘制GSEA KEGG图
+    if(!is.null(gsea_results$gsea_kegg) && nrow(gsea_results$gsea_kegg) > 0) {
+      # 点图
+      p_gsea_kegg_dot <- dotplot(gsea_results$gsea_kegg, showCategory = 15, 
+                                 title = paste("GSEA KEGG -", comparison_name))
+      ggsave(file.path(enrich_dir, paste0(comparison_name, "_GSEA_KEGG_dot.pdf")), 
+             p_gsea_kegg_dot, width = 10, height = 8)
+      
+      # 选择最显著的通路绘制详细图
+      top_pathways <- head(gsea_results$gsea_kegg, 3)
+      for(i in 1:nrow(top_pathways)) {
+        pathway_id <- top_pathways[i, "ID"]
+        pathway_desc <- top_pathways[i, "Description"]
+        
+        p_gsea <- gseaplot2(gsea_results$gsea_kegg, 
+                            geneSetID = pathway_id,
+                            title = paste("GSEA:", pathway_desc))
+        
+        ggsave(file.path(enrich_dir, paste0(comparison_name, "_GSEA_KEGG_", pathway_id, ".pdf")), 
+               p_gsea, width = 10, height = 8)
+      }
+    }
+  }
+  
+  # 执行绘图
+  plot_ORA_results(go_up, go_down, go_all, kegg_up, kegg_down, kegg_all, comparison_name, enrich_dir)
+  plot_GSEA_results(gsea_results, comparison_name, enrich_dir)
+  
+  return(list(
+    go_up = go_up, 
+    go_down = go_down, 
+    go_all = go_all,
+    kegg_up = kegg_up, 
+    kegg_down = kegg_down,
+    kegg_all = kegg_all,
+    gsea_results = gsea_results
+  ))
