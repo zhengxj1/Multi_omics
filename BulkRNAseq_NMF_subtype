@@ -105,6 +105,7 @@ vst_result <- vst(dds, blind = TRUE)
 vst_data <- assay(vst_result)
 # 将 VST 矩阵用于后续分析
 log_data <- vst_data # 重命名为 log_data 以匹配后续脚本变量名
+save(log_data,file='log_data.rda')
 # ==============================================================================
 # 3. MAD 高变基因筛选
 # ==============================================================================
@@ -129,7 +130,7 @@ print(paste("保留的目标基因:", retained_target_genes))
 # 4. 筛选 VST 矩阵
 log_data_filtered <- log_data[high_variance_genes, ]
 log_data <- log_data_filtered # 供后续步骤使用
-
+save(log_data_filtered,file='log_data_filtered.rda')
 print(paste("筛选后基因数量 (Top", TOP_PERCENTAGE*100, "%):", nrow(log_data)))
 # Z-score 标准化 (用于 HC 和 K-means，以及热图可视化)
 # 转置为 (样本 x 基因) 进行 scale，然后再转回 (基因 x 样本)
@@ -226,8 +227,6 @@ print(head(all_subtypes_df))
 print("--- 绘制最终热图 ---")
 # A. 准备特定基因列表
 # 请务必修改为您数据中真实存在的基因名！
-# 这里随机抽取前 30 个作为示例
-target_genes <- head(rownames(log_data), 30) 
 # 如果您有特定基因，请取消注释并填入：
 # target_genes <- c("TP53", "BRCA1", "EGFR", "MYC") # <---【可修改】
 target_genes=genes_to_check
@@ -414,15 +413,5 @@ ht <- Heatmap(plot_matrix_target,
 pdf( paste0(save_path, "/Topgenes.pdf"))
 draw(ht, merge_legend = TRUE)
 dev.off()
-
-
-
-
-
-
-
-
-
-
 
 
