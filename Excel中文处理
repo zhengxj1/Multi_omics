@@ -1,0 +1,40 @@
+library(readxl)
+library(writexl) # For saving the file
+library(dplyr)   # Optional, for easier data manipulation
+
+# 1. Read the Excel file
+# read_excel automatically handles unicode/Chinese characters well usually
+data <- read_excel("HER2.xlsx")
+
+# 2. Remove duplicates based on the first column
+# Method A: Using Base R (no extra package needed for this step)
+# data[[1]] refers to the first column regardless of its name
+data_dedup <- data[!duplicated(data[[1]]), ]
+
+# Method B: Using dplyr (if you prefer tidyverse style)
+# .keep_all = TRUE ensures you keep other columns, not just the unique keys
+# data_dedup <- data %>% distinct(across(1), .keep_all = TRUE)
+
+# 3. Save the result
+write_xlsx(data_dedup, "HER2_dedup.xlsx")
+
+print(paste("Original rows:", nrow(data)))
+print(paste("Rows after deduplication:", nrow(data_dedup)))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
