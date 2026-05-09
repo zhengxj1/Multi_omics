@@ -36,15 +36,14 @@ dat=as.data.frame(log2(edgeR::cpm(expr_cn)+1))
 png(filename="boxplot.png",width=480,height=480)  
 boxplot(dat)
 dev.off()
-####PCA####
-source("D:/BaiduSyncdisk/R code/scRNA_scripts/pca_and_ggplot2.R")
+
 library(ggplot2)
 library(ggpubr)
 library(cowplot)
 dat=t(dat)
-pca.ncg<-.pca(data = dat,
+pca.ncg<-pca_analysis (data = dat,
               is.log =T)
-.scatter.density.pc(pcs = pca.ncg$sing.val$v[, 1:2],
+plot_pca_scatter(pcs = pca.ncg$sing.val$v[, 1:2],
                     pc.var = pca.ncg$variation,
                     strokeColor = 'gray30',
                     strokeSize = .2,
